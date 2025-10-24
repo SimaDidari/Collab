@@ -1,10 +1,6 @@
 # G-Memory Rule Generation Timing and Stopping Conditions
 
-## Overview
 
-This document analyzes when G-Memory creates rules, when it stops generating them, and explains the HotpotQA scenario where 20 rules were generated despite the default 10-rule limit.
-
----
 
 ## When Rules Get Created
 
@@ -60,7 +56,8 @@ Each generation cycle creates rules through:
 
 ### The Truth: It Never Completely Stops
 
-G-Memory is designed as a **continuous learning system** that never fully stops generating rules. However, it has several **limiting and balancing mechanisms**:
+G-Memory is designed as a **continuous learning system** that never fully stops generating rules. 
+  However, it has several **limiting and balancing mechanisms**:
 
 ### 1. Memory Limit Enforcement
 
