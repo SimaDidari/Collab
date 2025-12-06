@@ -1059,11 +1059,11 @@ class HippoRAG:
         scores1 = np.dot(self.passage_embeddings, query_embedding.T)
 
         scores2 = np.zeros_like(scores1)
-        for idx, info  in self.clusters_info:
+        for idx, info  in enumerate(self.clusters_info):
             doc_indices = info["doc_indices"]
-            topic_embeddings = self.topic_data_list[i]["topic_embeddings"]
+            topic_embeddings = self.topic_data_list[idx]["topic_embeddings"]
             topic_scores = np.dot(topic_embeddings, query_embedding.T)
-            topic_doc_matrix = self.topic_doc_scores_list[i] # (shape  n_topics x n_docs)
+            topic_doc_matrix = self.topic_doc_scores_list[idx] # (shape  n_topics x n_docs)
             scores2[doc_indices] = np.dot(topic_doc_matrix.T, topic_scores)
 
         scores = (scores1 + scores2)/2
