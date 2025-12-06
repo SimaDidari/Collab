@@ -39,6 +39,8 @@ from .utils.misc_utils import NerRawOutput, TripleRawOutput
 from .utils.embed_utils import retrieve_knn
 from .utils.typing import Triple
 from .utils.config_utils import BaseConfig
+import faiss
+import pickle
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +51,7 @@ class TopicExtractor:
     CorEx finds maximally informative topics by maximizing total correlation.
     """
     
-    def __init__(self, n_topics: int = 50, n_top_words: int = 10, anchor_strength: float = 2.0):
+    def __init__(self, n_topics: int = 30, n_top_words: int = 20, anchor_strength: float = 2.0):
         """
         Initialize the TopicExtractor.
         
@@ -63,14 +65,9 @@ class TopicExtractor:
         self.n_topics = n_topics
         self.n_top_words = n_top_words
         self.anchor_strength = anchor_strength
-        self.vectorizer = None
-        self.model = None
-        self.topic_words = None
-        self.vocab = None
-        self.topic_sentences = None
-        self.topic_sentence_embeddings = None
+        return 
     
-    def _generate_topic_sentence(self, words: List[str],  llm_model: BaseLLM = None) -> str:
+    def _generate_topic_sentence(self, words: List[str],  llm_model: BaseLLM) -> str:
         """
         Generate a concise sentence representing the topic given a list of words.
         
@@ -85,7 +82,7 @@ class TopicExtractor:
             return " ".join(words)
         
         words_str = ", ".join(words)
-        prompt = f"Given these topic words: [{words_str}], generate a single concise sentence (max 15 words) that captures the essence of this topic. Output only the sentence, nothing else."
+        prompt = f"Given this list of topic words: [{words_str}], generate a single concise sentence (max 15 words) that captures the essence of this topic. Output only the sentence, nothing else."
         
         messages = [{"role": "user", "content": prompt}]
         try:
@@ -95,7 +92,7 @@ class TopicExtractor:
             logger.warning(f"Error generating topic sentence: {e}. Falling back to word concatenation.")
             return " ".join(words)
         
-    def fit(self, documents: List[str], topic_sentences_path: str = None,  llm_model: BaseLLM = None, embedding_model: BaseEmbeddingModel = None) -> Tuple[np.ndarray, List[str]]:
+    def fit(self, group_id: str, documents: List[str], llm_model: BaseLLM, embedding_model: BaseEmbeddingModel):
         """
         Extract topics from documents using CorEx.
         
@@ -109,7 +106,7 @@ class TopicExtractor:
             - topic_labels: List of topic label strings
         """
         # Create document-term matrix
-        self.vectorizer = CountVectorizer(
+        vectorizer = CountVectorizer(
             max_df=0.95, 
             min_df=2, 
             max_features=5000,
@@ -117,18 +114,18 @@ class TopicExtractor:
             ngram_range=(1, 2)
         )
         
-        doc_term_matrix = self.vectorizer.fit_transform(documents)
-        self.vocab = list(self.vectorizer.get_feature_names_out())
+        doc_term_matrix = vectorizer.fit_transform(documents)
+        vocab = list(vectorizer.get_feature_names_out())
         
         # Initialize and fit CorEx model
         # Note: words parameter goes in fit(), not __init__()
-        self.model = ct.Corex(n_hidden=self.n_topics, seed=42)
-        self.model.fit(doc_term_matrix, words=self.vocab)
+        model = ct.Corex(n_hidden=self.n_topics, seed=42)
+        model.fit(doc_term_matrix, words= vocab)
         
         # Get topic-document relevance scores using predict_proba
         # predict_proba returns tuple: (probabilities, log_odds)
         # probabilities shape: (n_docs, n_topics)
-        probs_tuple = self.model.predict_proba(doc_term_matrix)
+        probs_tuple = model.predict_proba(doc_term_matrix)
         topic_doc_matrix = np.exp(probs_tuple[0].T)  # shape: (n_topics, n_docs)
         
         # # Normalize to [0, 1] range
@@ -136,79 +133,33 @@ class TopicExtractor:
         
         # Get topic labels from top words - ensure uniqueness by appending index
         topic_labels = []
-        self.topic_words = []
-        self.topic_sentences = []
-        seen_labels = set()
+        topic_words = []
+        topic_sentences = []
         
         for topic_idx in range(self.n_topics):
             # 1) Extract the list of words for the topic
-            top_words = self.model.get_topics(topic=topic_idx, n_words=self.n_top_words)
-            if top_words:
-                words = [word for word, _, _ in top_words]
-                self.topic_words.append(words)
-                base_label = "_".join(words[:3])  # Use top 3 words as label
-            else:
-                self.topic_words.append([])
-                base_label = f"topic_{topic_idx}"
-            
-            # Ensure uniqueness by appending index if duplicate
-            label = base_label
-            if label in seen_labels:
-                label = f"{base_label}_{topic_idx}"
-            seen_labels.add(label)
+            top_words = model.get_topics(topic=topic_idx, n_words=self.n_top_words)
+            words = [word for word, _, _ in top_words]
+            topic_words.append(words)
+            label = f"topic_{group_id}_{topic_idx}"
             topic_labels.append(label)
-            
-            # 2) Generate a sentence representation using LLM
-            if self.topic_words[topic_idx]:
-                topic_sentence = self._generate_topic_sentence(self.topic_words[topic_idx], llm_model)
-            else:
-                topic_sentence = f"Topic {topic_idx}"
-            self.topic_sentences.append(topic_sentence)
+            topic_sentence = self._generate_topic_sentence(words, llm_model)
+            topic_sentences.append(topic_sentence)
             logger.info(f"Topic {topic_idx}: words={self.topic_words[topic_idx][:5]}, sentence='{topic_sentence}'")
+       
+        topic_embeddings = np.array(embedding_model.batch_encode(topic_sentences, norm=True))
+
+        topic_data = {
+            "topic_sentences": topic_sentences,
+            "topic_words": topic_words,
+            "topic_labels": topic_labels,
+            "topic_embeddings": topic_embeddings,
+        }
         
-        # Store topic sentences in JSON
-        if topic_sentences_path:
-            topic_sentences_data = {
-                "topic_sentences": self.topic_sentences,
-                "topic_words": self.topic_words,
-                "topic_labels": topic_labels
-            }
-            with open(topic_sentences_path, 'w') as f:
-                json.dump(topic_sentences_data, f, indent=2)
-            logger.info(f"Topic sentences saved to {topic_sentences_path}")
-        
-        # Pre-compute topic sentence embeddings if embedding model is available
-        if embedding_model is not None and self.topic_sentences:
-            logger.info("Computing topic sentence embeddings...")
-            self.topic_sentence_embeddings = np.array(
-                embedding_model.batch_encode(self.topic_sentences, norm=True)
-            )
-        
-        return topic_doc_matrix, topic_labels
+        return topic_data, topic_doc_matrix
     
-    def load_topic_sentences(self, topic_sentences_path: str, embedding_model: BaseEmbeddingModel = None):
-        """
-        Load topic sentences from JSON file.
-        
-        Args:
-            topic_sentences_path: Path to the topic sentences JSON file
-            embedding_model: Embedding model for computing embeddings
-        """
-        if os.path.exists(topic_sentences_path):
-            with open(topic_sentences_path, 'r') as f:
-                data = json.load(f)
-            self.topic_sentences = data.get("topic_sentences", [])
-            self.topic_words = data.get("topic_words", [])
-            logger.info(f"Loaded {len(self.topic_sentences)} topic sentences from {topic_sentences_path}")
-            
-            # Re-compute embeddings if embedding model is available
-            if embedding_model is not None and self.topic_sentences:
-                logger.info("Computing topic sentence embeddings...")
-                self.topic_sentence_embeddings = np.array(
-                    embedding_model.batch_encode(self.topic_sentences, norm=True)
-                )
     
-    def get_query_topic_scores(self, query: str, embedding_model: BaseEmbeddingModel = None) -> np.ndarray:
+    def get_query_topic_scores(self, query: str, topic_embeddings, embedding_model: BaseEmbeddingModel) -> np.ndarray:
         """
         Extract topic relevance scores for a query based on cosine similarity
         between the query embedding and topic sentence embeddings.
@@ -219,51 +170,12 @@ class TopicExtractor:
         Returns:
             Array of shape (n_topics,) with topic relevance scores for the query
         """
-        # Use cosine similarity with topic sentence embeddings if available
-        if embedding_model is not None and self.topic_sentence_embeddings is not None:
-            # Compute query embedding
-            query_embedding = np.array(embedding_model.batch_encode([query], norm=True))
-            query_embedding = query_embedding.squeeze()  # shape: (embedding_dim,)
-            
-            # Compute cosine similarity with all topic sentence embeddings
-            # topic_sentence_embeddings shape: (n_topics, embedding_dim)
-            # Since embeddings are normalized, dot product = cosine similarity
-            scores = np.dot(self.topic_sentence_embeddings, query_embedding)  # shape: (n_topics,)
-            
-            return scores
         
-        # Fallback to original CorEx-based method if no embedding model
-        if self.vectorizer is None or self.model is None:
-            raise ValueError("TopicExtractor must be fit before extracting query topics")
-        
-        # Transform query to document-term representation
-        query_term_matrix = self.vectorizer.transform([query])
-        
-        # Get topic probabilities for the query using predict_proba
-        # predict_proba returns tuple: (probabilities, log_odds)
-        probs_tuple = self.model.predict_proba(query_term_matrix)
-        query_topic_scores = np.exp(probs_tuple[0].squeeze())  # shape: (n_topics,)
+        query_embedding = np.array(embedding_model.batch_encode([query], norm=True))
+        query_embedding = query_embedding.squeeze()  # shape: (embedding_dim,)
+        scores = np.dot(topic_embeddings, query_embedding)  # shape: (n_topics,)  
+        return scores
 
-        
-        return query_topic_scores
-    
-    def get_topic_embedding_text(self, topic_idx: int) -> str:
-        """
-        Get a text representation of a topic for embedding.
-        
-        Args:
-            topic_idx: Index of the topic
-            
-        Returns:
-            String representation of the topic (sentence if available, otherwise words)
-        """
-        # Return topic sentence if available
-        if self.topic_sentences and topic_idx < len(self.topic_sentences):
-            return self.topic_sentences[topic_idx]
-        # Fallback to words
-        if self.topic_words and topic_idx < len(self.topic_words):
-            return " ".join(self.topic_words[topic_idx])
-        return f"topic {topic_idx}"
 
 
 class ClusteredTopicExtractor:
@@ -284,37 +196,23 @@ class ClusteredTopicExtractor:
         self.n_clusters = n_clusters
         self.n_topics_per_cluster = n_topics_per_cluster
         self.n_top_words = n_top_words
-        
-        # Per-cluster topic extractors
-        self.cluster_topic_extractors: Dict[int, TopicExtractor] = {}
-        self.cluster_assignments: np.ndarray = None
-        self.cluster_centroids: np.ndarray = None
-        
-        # Aggregated topic data
-        self.topic_sentences: List[str] = []
-        self.topic_words: List[List[str]] = []
-        self.topic_sentence_embeddings: np.ndarray = None
-        self.topic_to_cluster: Dict[int, int] = {}  # Maps global topic idx to cluster idx
-        
-    def fit(self, documents: List[str], topic_sentences_path: str = None, 
-            llm_model: BaseLLM = None, embedding_model: BaseEmbeddingModel = None) -> Tuple[np.ndarray, List[str]]:
+        return 
+    
+
+    def fit(self, documents: List[str], llm_model: BaseLLM, embedding_model: BaseEmbeddingModel):
         """
         Cluster documents and extract topics from each cluster.
         
         Args:
             documents: List of document strings
-            topic_sentences_path: Optional path to save/load topic sentences JSON
+            topic_data_path: path to save topic data (as pickle file)
+            topic_doc_scores_pah: path to save topic_doc scores (as pickle file)
             llm_model: LLM model for generating topic sentences
             embedding_model: Embedding model for clustering and similarity
             
         Returns:
             Tuple of (topic_document_matrix, topic_labels)
         """
-        import faiss
-        
-        if embedding_model is None:
-            raise ValueError("embedding_model is required for clustering")
-        
         logger.info(f"Clustering {len(documents)} documents into {self.n_clusters} clusters using Faiss K-means")
         
         # Get document embeddings for clustering
@@ -326,115 +224,42 @@ class ClusteredTopicExtractor:
         kmeans.train(doc_embeddings)
         
         # Get cluster assignments
-        _, self.cluster_assignments = kmeans.index.search(doc_embeddings, 1)
-        self.cluster_assignments = self.cluster_assignments.squeeze()
-        self.cluster_centroids = kmeans.centroids
+        _, cluster_assignments = kmeans.index.search(doc_embeddings, 1)
+        cluster_assignments = cluster_assignments.squeeze()
+        # self.cluster_centroids = kmeans.centroids
         
         # Log cluster sizes
-        cluster_sizes = {i: int(np.sum(self.cluster_assignments == i)) for i in range(self.n_clusters)}
+        cluster_sizes = {i: int(np.sum(cluster_assignments == i)) for i in range(self.n_clusters)}
         logger.info(f"Cluster sizes: {cluster_sizes}")
         
         # Extract topics for each cluster
-        all_topic_labels = []
-        self.topic_sentences = []
-        self.topic_words = []
-        global_topic_idx = 0
-        
-        # Initialize topic-document matrix (will be filled per cluster)
-        total_topics = self.n_clusters * self.n_topics_per_cluster
-        topic_doc_matrix = np.zeros((total_topics, len(documents)))
+        topic_data_list = []
+        topic_doc_scores_list =[]
+        clusters_info = []
+
+        topic_extractor = TopicExtractor(
+            n_topics=self.n_topics_per_cluster,
+            n_top_words=self.n_top_words
+        )
         
         for cluster_idx in range(self.n_clusters):
-            cluster_mask = self.cluster_assignments == cluster_idx
+            cluster_mask = cluster_assignments == cluster_idx
             cluster_doc_indices = np.where(cluster_mask)[0]
             cluster_docs = [documents[i] for i in cluster_doc_indices]
+            clusters_info.append({
+                "cluster_id": cluster_idx,
+                "doc_indices": cluster_doc_indices.tolist()
+            })
+            # generate topics 
+            topic_data, topic_doc_matrix = topic_extractor.fit(cluster_idx, cluster_docs, llm_model, embedding_model)
+            topic_data_list.append(topic_data)
+            topic_doc_scores_list.append(topic_doc_matrix)
             
-            if len(cluster_docs) < 3:
-                logger.warning(f"Cluster {cluster_idx} has only {len(cluster_docs)} documents, skipping topic extraction")
-                # Add placeholder topics for this cluster
-                for local_idx in range(self.n_topics_per_cluster):
-                    all_topic_labels.append(f"cluster_{cluster_idx}_topic_{local_idx}")
-                    self.topic_sentences.append(f"Cluster {cluster_idx} topic {local_idx}")
-                    self.topic_words.append([])
-                    self.topic_to_cluster[global_topic_idx] = cluster_idx
-                    global_topic_idx += 1
-                continue
-            
-            logger.info(f"Extracting topics for cluster {cluster_idx} with {len(cluster_docs)} documents")
-            
-            # Create and fit topic extractor for this cluster
-            cluster_extractor = TopicExtractor(
-                n_topics=self.n_topics_per_cluster,
-                n_top_words=self.n_top_words
-            )
-            
-            cluster_topic_doc_matrix, cluster_topic_labels = cluster_extractor.fit(
-                cluster_docs,
-                llm_model=llm_model,
-                embedding_model=embedding_model
-            )
-            self.cluster_topic_extractors[cluster_idx] = cluster_extractor
-            
-            # Map cluster topics to global topics
-            for local_topic_idx, label in enumerate(cluster_topic_labels):
-                global_label = f"c{cluster_idx}_{label}"
-                all_topic_labels.append(global_label)
-                self.topic_to_cluster[global_topic_idx] = cluster_idx
-                
-                # Copy topic sentences and words
-                if cluster_extractor.topic_sentences and local_topic_idx < len(cluster_extractor.topic_sentences):
-                    self.topic_sentences.append(cluster_extractor.topic_sentences[local_topic_idx])
-                else:
-                    self.topic_sentences.append(global_label)
-                    
-                if cluster_extractor.topic_words and local_topic_idx < len(cluster_extractor.topic_words):
-                    self.topic_words.append(cluster_extractor.topic_words[local_topic_idx])
-                else:
-                    self.topic_words.append([])
-                
-                # Fill in topic-document scores for documents in this cluster
-                for local_doc_idx, global_doc_idx in enumerate(cluster_doc_indices):
-                    topic_doc_matrix[global_topic_idx, global_doc_idx] = cluster_topic_doc_matrix[local_topic_idx, local_doc_idx]
-                
-                global_topic_idx += 1
-        
-        # Store topic sentences in JSON
-        if topic_sentences_path:
-            topic_sentences_data = {
-                "topic_sentences": self.topic_sentences,
-                "topic_words": self.topic_words,
-                "topic_labels": all_topic_labels,
-                "n_clusters": self.n_clusters,
-                "topic_to_cluster": self.topic_to_cluster
-            }
-            with open(topic_sentences_path, 'w') as f:
-                json.dump(topic_sentences_data, f, indent=2)
-            logger.info(f"Topic sentences saved to {topic_sentences_path}")
-        
-        # Pre-compute topic sentence embeddings
-        if embedding_model is not None and self.topic_sentences:
-            logger.info("Computing topic sentence embeddings...")
-            self.topic_sentence_embeddings = np.array(
-                embedding_model.batch_encode(self.topic_sentences, norm=True)
-            )
-        
-        return topic_doc_matrix, all_topic_labels
+        return topic_data_list, topic_doc_scores_list, clusters_info
     
-    def load_topic_sentences(self, topic_sentences_path: str, embedding_model: BaseEmbeddingModel = None):
-        """Load topic sentences from JSON file."""
-        if os.path.exists(topic_sentences_path):
-            with open(topic_sentences_path, 'r') as f:
-                data = json.load(f)
-            self.topic_sentences = data.get("topic_sentences", [])
-            self.topic_words = data.get("topic_words", [])
-            self.topic_to_cluster = {int(k): v for k, v in data.get("topic_to_cluster", {}).items()}
-            logger.info(f"Loaded {len(self.topic_sentences)} topic sentences from {topic_sentences_path}")
-            
-            if embedding_model is not None and self.topic_sentences:
-                logger.info("Computing topic sentence embeddings...")
-                self.topic_sentence_embeddings = np.array(
-                    embedding_model.batch_encode(self.topic_sentences, norm=True)
-                )
+
+    
+    
     
     def get_query_topic_scores(self, query: str, embedding_model: BaseEmbeddingModel = None) -> np.ndarray:
         """
@@ -454,14 +279,7 @@ class ClusteredTopicExtractor:
             return scores
         
         raise ValueError("ClusteredTopicExtractor requires embedding_model for query scoring")
-    
-    def get_topic_embedding_text(self, topic_idx: int) -> str:
-        """Get text representation of a topic for embedding."""
-        if self.topic_sentences and topic_idx < len(self.topic_sentences):
-            return self.topic_sentences[topic_idx]
-        if self.topic_words and topic_idx < len(self.topic_words):
-            return " ".join(self.topic_words[topic_idx])
-        return f"topic {topic_idx}"
+
 
 
 class HippoRAG:
@@ -551,12 +369,6 @@ class HippoRAG:
             os.path.join(self.working_dir, "fact_embeddings"),
             self.global_config.embedding_batch_size, 'fact')
         
-        # NEW: Topic embedding store
-        self.topic_embedding_store = EmbeddingStore(
-            self.embedding_model,
-            os.path.join(self.working_dir, "topic_embeddings"),
-            self.global_config.embedding_batch_size, 'topic')
-
         self.prompt_template_manager = PromptTemplateManager(
             role_mapping={"system": "system", "user": "user", "assistant": "assistant"})
 
@@ -574,20 +386,18 @@ class HippoRAG:
 
         self.ent_node_to_chunk_ids = None
         
-        # NEW: Topic-related attributes
-        self.topic_extractor: Union[TopicExtractor, ClusteredTopicExtractor] = None
-        self.topic_node_keys: List = []
-        self.topic_node_idxs: List = []
-        self.topic_embeddings: np.ndarray = None
-        self.topic_to_chunk_weights: Dict[str, Dict[str, float]] = {}
-        self.topic_labels: List[str] = []
-        
         # Topic configuration
         self.n_topics = getattr(self.global_config, 'n_topics', 10)
         self.n_clusters = getattr(self.global_config, 'n_clusters', 50)
         self.n_topics_per_cluster = getattr(self.global_config, 'n_topics_per_cluster', 20)
-        self.topic_node_weight = getattr(self.global_config, 'topic_node_weight', 0.5)
-        self.topic_edge_threshold = getattr(self.global_config, 'topic_edge_threshold', 0.2)
+
+        self.topic_data_list = []
+        self.topic_doc_scores_list =[]
+        self.clusters_info = []
+        # self.topic_node_weight = getattr(self.global_config, 'topic_node_weight', 0.5)
+        # self.topic_edge_threshold = getattr(self.global_config, 'topic_edge_threshold', 0.2)
+
+        return 
 
 
     def initialize_graph(self):
@@ -666,124 +476,86 @@ class HippoRAG:
         self.add_fact_edges(chunk_ids, chunk_triples)
         num_new_chunks = self.add_passage_edges(chunk_ids, chunk_triple_entities)
         
-        # NEW: Add topic edges
-        self._add_topic_edges(chunk_ids)
-
         if num_new_chunks > 0:
             logger.info(f"Found {num_new_chunks} new chunks to save into graph.")
             self.add_synonymy_edges()
             self.augment_graph()
             self.save_igraph()
 
+        return 
+    
+    def _get_topic_data_path(self):
+        topic_data_path = os.path.join(self.working_dir, "topic_data.pkl")
+        topic_doc_scores_path = os.path.join(self.working_dir, "topic_doc_scores.pkl")
+        clusters_info_path = os.path.join(self.working_dir, "doc_clusters_info.json")
+        return topic_data_path, topic_doc_scores_path, clusters_info_path
+
+    def _check_topic_data(self):
+        topic_data_path, topic_doc_scores_path, clusters_info_path = self._get_topic_data_path()        
+        return os.path.exists(topic_data_path) and os.path.exists(topic_doc_scores_path) and os.path.exists(clusters_info_path)
+    
+
+    def _load_topic_data(self):
+        topic_data_path, topic_doc_scores_path, clusters_info_path = self._get_topic_data_path()
+
+        with open(topic_data_path, 'rb') as f:
+            self.topic_data_list = pickle.load(f)
+        logger.info(f"Loaded topic data  from {topic_data_path}")
+
+    
+        if os.path.exists(topic_doc_scores_path):
+            with open(topic_doc_scores_path, 'rb') as f:
+                self.topic_doc_list  = pickle.load(f)
+        logger.info(f"Loaded topic doc scores from {topic_doc_scores_path}")
+
+        with open(clusters_info_path, 'r') as f:
+            self.clusters_info = json.load(f)
+        logger.info(f"Clusters info saved to {clusters_info_path}")
+        return 
+    
+    
+    def _save_topic_data(self):
+        topic_data_path, topic_doc_scores_path, clusters_info_path = self._get_topic_data_path()
+
+        with open(topic_data_path, 'wb') as f:
+            pickle.dump(self.topic_data_list, f)
+        logger.info(f"Topic data saved to {topic_data_path}")
+
+
+        with open(topic_doc_scores_path, 'wb') as f:
+            pickle.dump(self.topic_doc_scores_list, f)
+        logger.info(f"Topic doc scores to {topic_doc_scores_path}")
+
+        with open(clusters_info_path, 'w') as f:
+            json.dump(self.clusters_info, f)
+        logger.info(f"Clusters info saved to {clusters_info_path}")
+        return 
+
+
     def _extract_and_encode_topics(self, docs: List[str], chunk_ids: List[str]):
         """Extract topics from corpus documents using Clustered CorEx."""
-        topic_results_path = os.path.join(self.working_dir, "topic_results.json")
-        topic_model_path = os.path.join(self.working_dir, "topic_extractor.pkl")
-        topic_sentences_path = os.path.join(self.working_dir, "topic_sentences.json")
         
-        if not self.global_config.force_index_from_scratch and os.path.exists(topic_results_path):
-            logger.info("Loading existing topic results")
-            with open(topic_results_path, 'r') as f:
-                topic_data = json.load(f)
-            
-            self.topic_labels = topic_data['topic_labels']
-            self.topic_to_chunk_weights = topic_data['topic_to_chunk_weights']
-            topic_texts = topic_data.get('topic_texts', self.topic_labels)
-            
-            # Load the topic extractor (needed for query topic extraction)
-            if os.path.exists(topic_model_path):
-                import pickle
-                with open(topic_model_path, 'rb') as f:
-                    self.topic_extractor = pickle.load(f)
-                # Load topic sentences if available
-                if os.path.exists(topic_sentences_path):
-                    self.topic_extractor.load_topic_sentences(topic_sentences_path, embedding_model=self.embedding_model)
-                logger.info("Loaded existing TopicExtractor model")
-            else:
-                # Need to refit for query processing
-                logger.info("Refitting ClusteredTopicExtractor for query processing")
-                self.topic_extractor = ClusteredTopicExtractor(
-                    n_clusters=self.n_clusters,
-                    n_topics_per_cluster=self.n_topics_per_cluster
-                )
-                self.topic_extractor.fit(
-                    docs, 
-                    topic_sentences_path=topic_sentences_path, 
-                    llm_model=self.llm_model, 
-                    embedding_model=self.embedding_model
-                )
-                import pickle
-                with open(topic_model_path, 'wb') as f:
-                    pickle.dump(self.topic_extractor, f)
+        if not self.global_config.force_index_from_scratch and self._check_topic_data():
+            logger.info("Loading existing topic data")
+            self._load_topic_data()
         else:
             total_topics = self.n_clusters * self.n_topics_per_cluster
             logger.info(f"Extracting {total_topics} topics ({self.n_topics_per_cluster} per cluster) from {len(docs)} documents across {self.n_clusters} clusters")
             
             # Initialize and fit clustered topic extractor
-            self.topic_extractor = ClusteredTopicExtractor(
+            topic_extractor = ClusteredTopicExtractor(
                 n_clusters=self.n_clusters,
                 n_topics_per_cluster=self.n_topics_per_cluster
             )
-            topic_doc_matrix, self.topic_labels = self.topic_extractor.fit(
-                docs, 
-                topic_sentences_path=topic_sentences_path,
-                llm_model=self.llm_model,
-                embedding_model=self.embedding_model,
-            )
-            
-            # Save the topic extractor
-            import pickle
-            with open(topic_model_path, 'wb') as f:
-                pickle.dump(self.topic_extractor, f)
-            logger.info(f"Saved ClusteredTopicExtractor model to {topic_model_path}")
-            
-            # Build topic to chunk weights mapping
-            self.topic_to_chunk_weights = {}
-            topic_texts = []
-            
-            for topic_idx in range(len(self.topic_labels)):
-                topic_key = compute_mdhash_id(self.topic_labels[topic_idx], prefix="topic-")
-                topic_text = self.topic_extractor.get_topic_embedding_text(topic_idx)
-                topic_texts.append(topic_text)
+            self.topic_data_list, self.topic_doc_scores, self.clusters_info = self.topic_extractor.fit(docs, self.llm_model, self.embedding_model)
+            # saving topic data
+            logger.info("Saving generated topic data")
+            self._save_topic_data()
                 
-                self.topic_to_chunk_weights[topic_key] = {}
-                
-                weight_factor = 10
-                for doc_idx, chunk_id in enumerate(chunk_ids):
-                    weight = float(topic_doc_matrix[topic_idx, doc_idx])
-                    if weight > self.topic_edge_threshold:
-                        self.topic_to_chunk_weights[topic_key][chunk_id] = weight_factor*weight
-            
-            # Save topic results
-            topic_data = {
-                'topic_labels': self.topic_labels,
-                'topic_texts': topic_texts,
-                'topic_to_chunk_weights': self.topic_to_chunk_weights,
-                'n_clusters': self.n_clusters,
-                'n_topics_per_cluster': self.n_topics_per_cluster
-            }
-            with open(topic_results_path, 'w') as f:
-                json.dump(topic_data, f)
-            logger.info(f"Topic results saved to {topic_results_path}")
-        
-        # Encode topic texts (now using topic sentences)
-        logger.info(f"Encoding {len(topic_texts)} topics")
-        self.topic_embedding_store.insert_strings(topic_texts)
-        
-        logger.info(f"Extracted {len(topic_texts)} topics with {sum(len(v) for v in self.topic_to_chunk_weights.values())} topic-document edges")
+        logger.info(f"Extracting {total_topics} topics ({self.n_topics_per_cluster} per cluster) from {len(docs)} documents across {self.n_clusters} clusters")
+        return 
 
-    def _add_topic_edges(self, chunk_ids: List[str]):
-        """Add edges between topic nodes and passage nodes."""
-        logger.info("Adding topic-passage edges to graph")
-        num_topic_edges = 0
-        for topic_key, chunk_weights in self.topic_to_chunk_weights.items():
-            for chunk_key, weight in chunk_weights.items():
-                if chunk_key in chunk_ids:
-                    self.node_to_node_stats[(topic_key, chunk_key)] = weight
-                    self.node_to_node_stats[(chunk_key, topic_key)] = weight
-                    num_topic_edges += 1
-        logger.info(f"Added {num_topic_edges} topic-passage edges")
-
+    
     def delete(self, docs_to_delete: List[str]):
         """Delete documents from all data structures."""
         if not self.ready_to_retrieve:
@@ -826,23 +598,14 @@ class HippoRAG:
             if len(non_deleted_docs) == 0:
                 filtered_ent_ids_to_delete.append(ent_node)
 
-        # Handle topic node deletion
-        topic_ids_to_delete = []
-        for topic_key, chunk_weights in self.topic_to_chunk_weights.items():
-            associated_chunks = set(chunk_weights.keys())
-            remaining_chunks = associated_chunks.difference(chunk_ids_to_delete)
-            if len(remaining_chunks) == 0:
-                topic_ids_to_delete.append(topic_key)
-
-        logger.info(f"Deleting {len(chunk_ids_to_delete)} Chunks, {len(triple_ids_to_delete)} Triples, {len(filtered_ent_ids_to_delete)} Entities, {len(topic_ids_to_delete)} Topics")
+        logger.info(f"Deleting {len(chunk_ids_to_delete)} Chunks, {len(triple_ids_to_delete)} Triples, {len(filtered_ent_ids_to_delete)} Entities")
 
         self.save_openie_results(all_openie_info_with_deletes)
         self.entity_embedding_store.delete(filtered_ent_ids_to_delete)
         self.fact_embedding_store.delete(triple_ids_to_delete)
         self.chunk_embedding_store.delete(chunk_ids_to_delete)
-        self.topic_embedding_store.delete(topic_ids_to_delete)
 
-        nodes_to_delete = list(filtered_ent_ids_to_delete) + list(chunk_ids_to_delete) + topic_ids_to_delete
+        nodes_to_delete = list(filtered_ent_ids_to_delete) + list(chunk_ids_to_delete)
         self.graph.delete_vertices(nodes_to_delete)
         self.save_igraph()
         self.ready_to_retrieve = False
@@ -1125,14 +888,14 @@ class HippoRAG:
         self.add_new_edges()
         logger.info(f"Graph construction completed!")
         print(self.get_graph_info())
+        return 
 
     def add_new_nodes(self):
         """Add nodes from all embedding stores."""
         existing_nodes = {v["name"]: v for v in self.graph.vs if "name" in v.attributes()}
         entity_to_row = self.entity_embedding_store.get_all_id_to_rows()
         passage_to_row = self.chunk_embedding_store.get_all_id_to_rows()
-        topic_to_row = self.topic_embedding_store.get_all_id_to_rows()
-        node_to_rows = {**entity_to_row, **passage_to_row, **topic_to_row}
+        node_to_rows = {**entity_to_row, **passage_to_row}
         new_nodes = {}
         for node_id, node in node_to_rows.items():
             node['name'] = node_id
@@ -1143,6 +906,7 @@ class HippoRAG:
                     new_nodes[k].append(v)
         if len(new_nodes) > 0:
             self.graph.add_vertices(n=len(next(iter(new_nodes.values()))), attributes=new_nodes)
+        return 
 
     def add_new_edges(self):
         """Add edges from node_to_node_stats to graph."""
@@ -1166,15 +930,13 @@ class HippoRAG:
         self.graph.write_pickle(self._graph_pickle_filename)
 
     def get_graph_info(self) -> Dict:
-        """Get graph statistics including topic nodes."""
+        """Get graph statistics"""
         graph_info = {}
         phrase_nodes_keys = self.entity_embedding_store.get_all_ids()
         graph_info["num_phrase_nodes"] = len(set(phrase_nodes_keys))
         passage_nodes_keys = self.chunk_embedding_store.get_all_ids()
         graph_info["num_passage_nodes"] = len(set(passage_nodes_keys))
-        topic_nodes_keys = self.topic_embedding_store.get_all_ids()
-        graph_info["num_topic_nodes"] = len(set(topic_nodes_keys))
-        graph_info["num_total_nodes"] = graph_info["num_phrase_nodes"] + graph_info["num_passage_nodes"] + graph_info["num_topic_nodes"]
+        graph_info["num_total_nodes"] = graph_info["num_phrase_nodes"] + graph_info["num_passage_nodes"]
         graph_info["num_extracted_triples"] = len(self.fact_embedding_store.get_all_ids())
         graph_info["num_total_triples"] = len(self.node_to_node_stats)
         return graph_info
@@ -1182,13 +944,13 @@ class HippoRAG:
     def prepare_retrieval_objects(self):
         """Prepare objects for fast retrieval."""
         logger.info("Preparing for fast retrieval.")
-        self.query_to_embedding = {'triple': {}, 'passage': {}, 'topic': {}}
+        self.query_to_embedding = {'triple': {}, 'passage': {}}
         self.entity_node_keys = list(self.entity_embedding_store.get_all_ids())
         self.passage_node_keys = list(self.chunk_embedding_store.get_all_ids())
         self.fact_node_keys = list(self.fact_embedding_store.get_all_ids())
-        self.topic_node_keys = list(self.topic_embedding_store.get_all_ids())
+        
 
-        expected_node_count = len(self.entity_node_keys) + len(self.passage_node_keys) + len(self.topic_node_keys)
+        expected_node_count = len(self.entity_node_keys) + len(self.passage_node_keys) 
         actual_node_count = self.graph.vcount()
         if expected_node_count != actual_node_count:
             logger.warning(f"Graph node count mismatch: expected {expected_node_count}, got {actual_node_count}")
@@ -1199,7 +961,7 @@ class HippoRAG:
         try:
             igraph_name_to_idx = {node["name"]: idx for idx, node in enumerate(self.graph.vs)}
             self.node_name_to_vertex_idx = igraph_name_to_idx
-            missing_nodes = [k for k in self.entity_node_keys + self.passage_node_keys + self.topic_node_keys if k not in igraph_name_to_idx]
+            missing_nodes = [k for k in self.entity_node_keys + self.passage_node_keys  if k not in igraph_name_to_idx]
             if missing_nodes:
                 logger.warning(f"Missing {len(missing_nodes)} nodes in graph")
                 self.add_new_nodes()
@@ -1208,35 +970,19 @@ class HippoRAG:
                 self.node_name_to_vertex_idx = igraph_name_to_idx
             self.entity_node_idxs = [igraph_name_to_idx[k] for k in self.entity_node_keys]
             self.passage_node_idxs = [igraph_name_to_idx[k] for k in self.passage_node_keys]
-            self.topic_node_idxs = [igraph_name_to_idx[k] for k in self.topic_node_keys]
         except Exception as e:
             logger.error(f"Error creating node index mapping: {str(e)}")
             self.node_name_to_vertex_idx = {}
-            self.entity_node_idxs, self.passage_node_idxs, self.topic_node_idxs = [], [], []
+            self.entity_node_idxs, self.passage_node_idxs = [], []
 
         logger.info("Loading embeddings.")
         self.entity_embeddings = np.array(self.entity_embedding_store.get_embeddings(self.entity_node_keys))
         self.passage_embeddings = np.array(self.chunk_embedding_store.get_embeddings(self.passage_node_keys))
         self.fact_embeddings = np.array(self.fact_embedding_store.get_embeddings(self.fact_node_keys))
-        self.topic_embeddings = np.array(self.topic_embedding_store.get_embeddings(self.topic_node_keys))
 
-        # Load topic model
-        topic_results_path = os.path.join(self.working_dir, "topic_results.json")
-        topic_model_path = os.path.join(self.working_dir, "topic_extractor.pkl")
-        topic_sentences_path = os.path.join(self.working_dir, "topic_sentences.json")
-        if os.path.exists(topic_results_path):
-            with open(topic_results_path, 'r') as f:
-                topic_data = json.load(f)
-            self.topic_to_chunk_weights = topic_data['topic_to_chunk_weights']
-            self.topic_labels = topic_data['topic_labels']
-        if os.path.exists(topic_model_path):
-            import pickle
-            with open(topic_model_path, 'rb') as f:
-                self.topic_extractor = pickle.load(f)
-            # Load topic sentences if available
-            if os.path.exists(topic_sentences_path):
-                self.topic_extractor.load_topic_sentences(topic_sentences_path, embedding_model=self.embedding_model)
-            logger.info("Loaded TopicExtractor for query processing")
+        # Load topic data
+        self._load_topic_data()
+        logger.info("Loaded topic data  for query processing")
 
         all_openie_info, _ = self.load_existing_openie([])
         self.proc_triples_to_docs = {}
@@ -1260,6 +1006,7 @@ class HippoRAG:
             self.add_fact_edges(self.passage_node_keys, chunk_triples)
 
         self.ready_to_retrieve = True
+        return 
 
     def get_query_embeddings(self, queries):
         """Get embeddings for queries."""
@@ -1270,11 +1017,12 @@ class HippoRAG:
                 all_query_strings.append(q_str)
         if len(all_query_strings) > 0:
             logger.info(f"Encoding {len(all_query_strings)} queries")
-            for instr_type in ['triple', 'passage', 'topic']:
+            for instr_type in ['triple', 'passage']:
                 instr = get_query_instruction('query_to_fact' if instr_type == 'triple' else 'query_to_passage')
                 embeddings = self.embedding_model.batch_encode(all_query_strings, instruction=instr, norm=True)
                 for query, emb in zip(all_query_strings, embeddings):
                     self.query_to_embedding[instr_type][query] = emb
+        return 
 
     def get_fact_scores(self, query: str) -> np.ndarray:
         """Get fact scores for query."""
@@ -1290,52 +1038,6 @@ class HippoRAG:
         except:
             return np.array([])
 
-    def get_topic_scores_from_embedding(self, query: str) -> np.ndarray:
-        """Get topic scores using embedding similarity."""
-        query_embedding = self.query_to_embedding['topic'].get(query)
-        if query_embedding is None:
-            query_embedding = self.embedding_model.batch_encode(query, instruction=get_query_instruction('query_to_passage'), norm=True)
-        if len(self.topic_embeddings) == 0:
-            return np.array([])
-        try:
-            scores = np.dot(self.topic_embeddings, query_embedding.T)
-            scores = np.squeeze(scores) if scores.ndim == 2 else scores
-            return min_max_normalize(scores)
-        except:
-            return np.array([])
-
-    def get_topic_scores_from_corex(self, query: str) -> np.ndarray:
-        """Extract topic scores directly from query using CorEx model or cosine similarity with topic sentences."""
-        if self.topic_extractor is None:
-            return self.get_topic_scores_from_embedding(query)
-        try:
-            scores = self.topic_extractor.get_query_topic_scores(query, embedding_model=self.embedding_model)
-            return min_max_normalize(scores)
-        except Exception as e:
-            logger.error(f"Error extracting topics from query using CorEx: {str(e)}")
-            return self.get_topic_scores_from_embedding(query)
-
-    def get_combined_topic_scores(self, query: str, corex_weight: float = 0.6) -> np.ndarray:
-        """Combine CorEx and embedding-based topic scores."""
-        corex_scores = self.get_topic_scores_from_corex(query)
-        embedding_scores = self.get_topic_scores_from_embedding(query)
-        
-        if len(corex_scores) == 0:
-            return embedding_scores
-        if len(embedding_scores) == 0:
-            return corex_scores
-        
-        # Handle shape mismatch - use the smaller size (embedding-based)
-        # This happens when some topics have duplicate/empty labels
-        n_topics = min(len(corex_scores), len(embedding_scores))
-        if len(corex_scores) != len(embedding_scores):
-            logger.debug(f"Topic score shape mismatch: corex={len(corex_scores)}, embedding={len(embedding_scores)}. Using {n_topics} topics.")
-            corex_scores = corex_scores[:n_topics]
-            embedding_scores = embedding_scores[:n_topics]
-        
-        combined = corex_weight * corex_scores + (1 - corex_weight) * embedding_scores
-        return min_max_normalize(combined)
-
     def dense_passage_retrieval(self, query: str) -> Tuple[np.ndarray, np.ndarray]:
         """Dense passage retrieval."""
         query_embedding = self.query_to_embedding['passage'].get(query)
@@ -1346,6 +1048,31 @@ class HippoRAG:
         scores = min_max_normalize(scores)
         sorted_ids = np.argsort(scores)[::-1]
         return sorted_ids, scores[sorted_ids]
+    
+    
+    def mixed_dense_passage_retrieval(self, query:str):
+        """Dense passage retrieval."""
+        query_embedding = self.query_to_embedding['passage'].get(query)
+        if query_embedding is None:
+            query_embedding = self.embedding_model.batch_encode(query, instruction=get_query_instruction('query_to_passage'), norm=True)
+
+        scores1 = np.dot(self.passage_embeddings, query_embedding.T)
+
+        scores2 = np.zeros_like(scores1)
+        for idx, info  in self.clusters_info:
+            doc_indices = info["doc_indices"]
+            topic_embeddings = self.topic_data_list[i]["topic_embeddings"]
+            topic_scores = np.dot(topic_embeddings, query_embedding.T)
+            topic_doc_matrix = self.topic_doc_scores_list[i] # (shape  n_topics x n_docs)
+            scores2[doc_indices] = np.dot(topic_doc_matrix.T, topic_scores)
+
+        scores = (scores1 + scores2)/2
+        scores = np.squeeze(scores) if scores.ndim == 2 else scores
+        scores = min_max_normalize(scores)
+        sorted_ids = np.argsort(scores)[::-1]
+        return sorted_ids, scores[sorted_ids]
+
+
 
     def get_top_k_weights(self, link_top_k, all_phrase_weights, linking_score_map):
         """Filter to top-k phrase weights."""
@@ -1364,7 +1091,6 @@ class HippoRAG:
         phrase_scores = {}
         phrase_weights = np.zeros(len(self.graph.vs['name']))
         passage_weights = np.zeros(len(self.graph.vs['name']))
-        topic_weights = np.zeros(len(self.graph.vs['name']))
         number_of_occurs = np.zeros(len(self.graph.vs['name']))
         phrases_and_ids = set()
 
@@ -1398,21 +1124,9 @@ class HippoRAG:
         if link_top_k:
             phrase_weights, linking_score_map = self.get_top_k_weights(link_top_k, phrase_weights, linking_score_map)
 
-        # Topic weights using combined CorEx + embedding scores
-        query_topic_scores = self.get_combined_topic_scores(query)
-        if len(query_topic_scores) > 0 and len(self.topic_node_keys) > 0:
-            num_topics = min(link_top_k, len(query_topic_scores))
-            top_topic_indices = np.argsort(query_topic_scores)[-num_topics:][::-1]
-            for topic_idx in top_topic_indices:
-                if topic_idx < len(self.topic_node_keys):
-                    topic_key = self.topic_node_keys[topic_idx]
-                    topic_score = query_topic_scores[topic_idx]
-                    topic_node_id = self.node_name_to_vertex_idx.get(topic_key)
-                    if topic_node_id is not None and topic_score > 0.1:
-                        topic_weights[topic_node_id] = topic_score # * self.topic_node_weight
 
         # Passage weights from DPR
-        dpr_sorted_ids, dpr_sorted_scores = self.dense_passage_retrieval(query)
+        dpr_sorted_ids, dpr_sorted_scores = self.mixed_dense_passage_retrieval(query)
         normalized_dpr_scores = min_max_normalize(dpr_sorted_scores)
         for i, doc_id in enumerate(dpr_sorted_ids.tolist()):
             passage_key = self.passage_node_keys[doc_id]
@@ -1420,7 +1134,7 @@ class HippoRAG:
             passage_weights[passage_node_id] = normalized_dpr_scores[i] * passage_node_weight
 
         # Combine all weights for PPR
-        node_weights = phrase_weights + passage_weights + topic_weights
+        node_weights = phrase_weights + passage_weights
         assert sum(node_weights) > 0, f'No weights found for query'
 
         ppr_start = time.time()
